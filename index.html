@@ -497,6 +497,7 @@ async function checkout(received) {
   } catch (err) {
     toast('Ошибка: ' + err.message, 'err');
     if (btn) { btn.disabled = false; btn.textContent = 'ПРОБИТЬ ЧЕК'; }
+    if (String(err.message).includes('Смена закрыта')) { closeModal(); await syncShift(); }
   } finally { busy = false; }
 }
 
@@ -531,6 +532,13 @@ function printReceipt(r) {
   </div>`;
   printHTML(html);
 }
+async function reprintOrder(id) {
+  const { data, error } = await db.rpc('get_order', { p_order_id: id });
+  if (error || !data) return toast('Не удалось загрузить чек: ' + (error ? error.message : 'не найден'), 'err');
+  const total = Number(data.total), received = data.received != null ? Number(data.received) : null;
+  printReceipt({ orderNumber: data.order_id, time: data.created_at, items: data.items, total, method: data.method,
+                 received, change: received != null ? r2(received - total) : null });
+}
 function reprintLastReceipt() {
   if (!lastReceipt) return toast('Нет последнего чека', 'err');
   printReceipt(lastReceipt);
@@ -539,6 +547,18 @@ function reprintLastReceipt() {
 // ===================== СМЕНА =====================
 async function openShift() {
   try {
+    // если в базе уже есть незакрытая смена (например, браузер очистился) — продолжаем её
+    const { data: open, error: oe } = await db.from('shifts').select('id,opened_at')
+      .is('closed_at', null).order('id', { ascending: false }).limit(1).maybeSingle();
+    if (oe) throw oe;
+    if (open && confirm(`Найдена незакрытая смена №${open.id} от ${new Date(open.opened_at).toLocaleString('ru-RU')}.\n\nПродолжить её? (Отмена — открыть новую)`)) {
+      shift = { id: open.id, openedAt: open.opened_at, cash: 0, kaspi: 0, total: 0, count: 0 };
+      salesLog = []; save('salesLog', salesLog);
+      await refreshShiftStats();
+      $('shift-overlay').style.display = 'none';
+      toast(`Продолжаем смену №${shift.id}`, 'ok');
+      return;
+    }
     const { data, error } = await db.from('shifts').insert({ opened_at: new Date().toISOString() }).select().single();
     if (error) throw error;
     shift = { id: data.id, openedAt: data.opened_at, cash: 0, kaspi: 0, total: 0, count: 0 };
@@ -547,6 +567,39 @@ async function openShift() {
     $('shift-overlay').style.display = 'none';
     toast(`Смена №${shift.id} открыта`, 'ok');
   } catch (e) { alert('Не удалось открыть смену: ' + e.message); }
+}
+
+// смена всегда сверяется с базой: браузер может потерять свои данные, база — нет
+async function syncShift() {
+  try {
+    let found = null;
+    if (shift && shift.id) {
+      const r = await db.from('shifts').select('id,opened_at,closed_at').eq('id', shift.id).maybeSingle();
+      if (r.error) return;                       // нет связи — работаем с тем, что есть
+      if (r.data && !r.data.closed_at) found = r.data;
+    }
+    if (!found) {
+      const r = await db.from('shifts').select('id,opened_at,closed_at')
+        .is('closed_at', null).order('id', { ascending: false }).limit(1).maybeSingle();
+      if (r.error) return;
+      found = r.data;
+    }
+    if (found) {
+      if (!shift || shift.id !== found.id) shift = { id: found.id, openedAt: found.opened_at, cash: 0, kaspi: 0, total: 0, count: 0 };
+      await refreshShiftStats();
+    } else {
+      shift = null; salesLog = [];
+      save('shift', null); save('salesLog', null);
+    }
+    $('shift-overlay').style.display = shift ? 'none' : 'flex';
+  } catch {}
+}
+async function refreshShiftStats() {
+  if (!shift) return;
+  const { data, error } = await db.rpc('shift_report', { p_shift_id: shift.id });
+  if (error || !data) return;
+  Object.assign(shift, { cash: Number(data.cash), kaspi: Number(data.kaspi), total: Number(data.total), count: Number(data.orders) });
+  save('shift', shift);
 }
 
 async function getReport() {
@@ -580,8 +633,15 @@ function reportHTML(rep, title) {
   </div>`;
 }
 
-function openShiftPanel() {
+async function openShiftPanel() {
   if (!shift) return;
+  openModal('<h3>📊 Смена</h3><div>Загрузка из базы…</div>', true);
+  await refreshShiftStats();
+  const { data: list, error } = await db.rpc('shift_orders', { p_shift_id: shift.id });
+  const log = (!error && Array.isArray(list))
+    ? list.map(o => ({ time: o.created_at, orderNumber: o.id, amount: Number(o.total), method: o.method }))
+    : salesLog;
+  if (!modalOpen()) return;
   openModal(`
     <h3>📊 Смена №${shift.id}</h3>
     <div>Открыта: ${new Date(shift.openedAt).toLocaleString('ru-RU')}</div>
@@ -592,9 +652,9 @@ function openShiftPanel() {
       <div class="stats-line" style="border-top:1px solid #ccc;padding-top:5px;font-weight:bold;">
         <span>💰 Выручка:</span><strong style="color:#2ec4b6;">${money(shift.total)} ₸</strong></div>
     </div>
-    <h4 style="margin:4px 0;">Журнал продаж</h4>
-    <div class="sales-log">${salesLog.length ? salesLog.map(l => `
-      <div class="log-item"><span>${new Date(l.time).toLocaleTimeString('ru-RU')} — №${l.orderNumber}</span><span>${esc(l.method)} — ${money(l.amount)} ₸</span></div>`).join('')
+    <h4 style="margin:4px 0;">Журнал продаж ${error ? '<small style="color:#dc3545">(нет связи — показаны данные этого компьютера)</small>' : '<small style="color:#888">— нажмите на чек, чтобы напечатать его снова</small>'}</h4>
+    <div class="sales-log">${log.length ? log.map(l => `
+      <div class="log-item" style="cursor:pointer" onclick="reprintOrder(${l.orderNumber})"><span>${new Date(l.time).toLocaleTimeString('ru-RU')} — №${l.orderNumber}</span><span>${esc(l.method)} — ${money(l.amount)} ₸ 🖨</span></div>`).join('')
       : '<div style="color:#aaa;font-style:italic;">Пока продаж нет</div>'}</div>
     <div class="m-actions col">
       <button class="pay-btn" style="background:#28a745" onclick="printXReport()">Печать X-отчёта (без закрытия)</button>
@@ -660,6 +720,8 @@ function init() {
   $('store-name').textContent = STORE_NAME;
   $('shift-overlay').style.display = shift ? 'none' : 'flex';
   renderCart();
+  try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {}
+  syncShift();
   reloadCatalog();
 }
 init();
